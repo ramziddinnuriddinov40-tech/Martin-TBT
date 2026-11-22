@@ -3,11 +3,10 @@ import { GoogleGenAI } from "@google/genai";
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-// Модель можно сменить в Render без правки кода (переменная GEMINI_MODEL)
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 // Запасная модель на случай перегрузки основной (необязательно)
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "";
-// Пример: ALLOWED_CHAT_IDS=123456789,987654321
+// Необязательно. Пример: ALLOWED_CHAT_IDS=123456789,987654321
 const ALLOWED = new Set(
   (process.env.ALLOWED_CHAT_IDS || "")
     .split(",")
@@ -20,16 +19,34 @@ if (!TELEGRAM_TOKEN || !GEMINI_API_KEY) {
   console.error("Нужны переменные TELEGRAM_BOT_TOKEN и GEMINI_API_KEY");
   process.exit(1);
 }
-if (ALLOWED.size === 0) {
-  console.warn("ВНИМАНИЕ: ALLOWED_CHAT_IDS пуст — бот отвечает всем!");
-}
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 const API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-const SYSTEM_PROMPT = `Extract driver details from the attached CDL/Medical Card image(s) and user notes.
-If the notes mention "team" or include 2 drivers, use the #team template. Otherwise, use the #solo template.
-Output ONLY the filled template with no extra commentary or bolding (**). Leave unknown fields blank after the colon. Default Rate to $0.95/mile and Escrow to $2,500 (10 weeks) unless stated otherwise.
+const SYSTEM_PROMPT = `You receive a transcript of a phone/voice conversation between a trucking recruiter (logistician) and a truck driver. The transcript may be in any language (English, Russian, Uzbek, etc.), may have speaker labels or not, and may contain speech-to-text mistakes.
+
+Your job: extract the DRIVER's details and fill in the template below.
+
+RULES:
+- Output ONLY the filled template. No commentary, no explanations, no bold (**), no code fences.
+- Always write the template in English, whatever language the transcript is in.
+- Use "#team" template if the transcript mentions two drivers, a team, a partner/co-driver (wife, husband, brother, friend driving together). Otherwise use "#solo".
+- Take facts only from the transcript. NEVER invent or guess. If a field is not mentioned, leave it blank after the colon.
+- Facts about the driver come from the driver's own words. The recruiter's offers are NOT the driver's data, except Rate/Escrow/Work days/Home days when they were agreed in the conversation.
+- Names: write in Latin letters, properly capitalized (First Last). If the name is unclear or likely misheard, leave it blank or put your best spelling and add "check name spelling" in Notes.
+- Phone: digits in a normal format, e.g. +1 555 123 4567. If spoken as words, convert to digits. If unclear, leave blank.
+- Email: if spelled out ("john dot smith at gmail dot com"), convert to john.smith@gmail.com. If unclear, leave blank.
+- Experience: years and type, e.g. "3 years OTR, 1 year local".
+- Rate: use what was agreed in the conversation. If nothing was said, write $0.95/mile.
+- Escrow: use what was agreed. If nothing was said, write $2,500 (10 weeks).
+- Work days / Home days: e.g. "3 weeks out" / "1 week home". Blank if not discussed.
+- Zip code: the driver's home zip code if mentioned (5 digits). Blank otherwise.
+- Ready: when the driver can start (e.g. "next Monday", "immediately", "in 2 weeks").
+- English level: judge only from what the conversation says (e.g. driver says "good English", or the recruiter notes it). If not stated, leave blank.
+- Work Authorization: citizen, green card, work permit/EAD, etc. Only if mentioned.
+- Application status: only if stated (e.g. "interested", "will send documents", "thinking"). Otherwise blank.
+- Nationality: only if mentioned.
+- Notes: short, useful extras in English, separated by commas or short lines: truck/trailer preferences, endorsements (hazmat, tanker, doubles), accidents/violations, current employer, why leaving, special conditions, things to double-check. Keep it brief. Do not repeat what is already in other fields.
 
 --- SOLO TEMPLATE ---
 Recruiter: #Martin
@@ -107,28 +124,19 @@ async function send(chatId, text) {
   }
 }
 
-async function downloadTelegramFile(fileId, fallbackMime) {
+// Скачать текстовый файл (.txt), если расшифровку прислали файлом
+async function downloadTextFile(fileId) {
   const meta = await tg("getFile", { file_id: fileId });
-  const filePath = meta.file_path;
   const res = await fetch(
-    `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`
+    `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${meta.file_path}`
   );
   if (!res.ok) throw new Error(`Не удалось скачать файл: ${res.status}`);
-  const buffer = Buffer.from(await res.arrayBuffer());
-
-  const lower = filePath.toLowerCase();
-  let mimeType = fallbackMime || "image/jpeg";
-  if (lower.endsWith(".png")) mimeType = "image/png";
-  else if (lower.endsWith(".webp")) mimeType = "image/webp";
-  else if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) mimeType = "image/jpeg";
-
-  return { base64: buffer.toString("base64"), mimeType };
+  return await res.text();
 }
 
 // ---------- Gemini ----------
 
-async function askGemini(parts) {
-  // Основная модель + необязательная запасная (GEMINI_FALLBACK_MODEL)
+async function askGemini(transcript) {
   const models = [GEMINI_MODEL];
   if (GEMINI_FALLBACK_MODEL && GEMINI_FALLBACK_MODEL !== GEMINI_MODEL) {
     models.push(GEMINI_FALLBACK_MODEL);
@@ -141,8 +149,13 @@ async function askGemini(parts) {
       try {
         const response = await ai.models.generateContent({
           model,
-          contents: [{ role: "user", parts }],
-          config: { systemInstruction: SYSTEM_PROMPT },
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: "TRANSCRIPT:\n\n" + transcript }],
+            },
+          ],
+          config: { systemInstruction: SYSTEM_PROMPT, temperature: 0.1 },
         });
         const text = (response.text || "")
           .replace(/^```[a-z]*\n?/i, "")
@@ -154,9 +167,10 @@ async function askGemini(parts) {
       } catch (err) {
         lastErr = err;
         const msg = String(err.message || err);
-        // Временные ошибки (перегрузка, лимит) — повторяем.
-        // Остальные (404, 400, 403) — смысла повторять нет.
-        const temporary = /503|429|500|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|fetch failed/i.test(msg);
+        const temporary =
+          /503|429|500|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|fetch failed/i.test(
+            msg
+          );
         if (!temporary) break;
       }
       if (attempt < 6) {
@@ -168,37 +182,12 @@ async function askGemini(parts) {
   throw lastErr;
 }
 
-// ---------- Обработка сообщений ----------
+// ---------- Обработка ----------
 
-async function processMessages(chatId, msgs) {
+async function processTranscript(chatId, transcript) {
   try {
     await tg("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
-
-    const notes = msgs
-      .map((m) => m.caption || m.text || "")
-      .filter(Boolean)
-      .join("\n");
-
-    const parts = [];
-    if (notes) parts.push({ text: notes });
-
-    for (const m of msgs) {
-      if (Array.isArray(m.photo) && m.photo.length > 0) {
-        const largest = m.photo[m.photo.length - 1];
-        const { base64, mimeType } = await downloadTelegramFile(largest.file_id);
-        parts.push({ inlineData: { data: base64, mimeType } });
-      } else if (m.document && (m.document.mime_type || "").startsWith("image/")) {
-        const { base64, mimeType } = await downloadTelegramFile(
-          m.document.file_id,
-          m.document.mime_type
-        );
-        parts.push({ inlineData: { data: base64, mimeType } });
-      }
-    }
-
-    if (parts.length === 0) return;
-
-    const text = await askGemini(parts);
+    const text = await askGemini(transcript);
     await send(chatId, text);
   } catch (err) {
     console.error("Ошибка обработки:", err);
@@ -206,38 +195,63 @@ async function processMessages(chatId, msgs) {
   }
 }
 
-// Альбомы: собираем сообщения с одним media_group_id в один запрос
-const albums = new Map();
+// Длинный текст Telegram режет на несколько сообщений подряд.
+// Собираем сообщения одного чата и обрабатываем вместе через 3 секунды тишины.
+const buffers = new Map();
 
-function handleMessage(msg) {
+function addToBuffer(chatId, text) {
+  let buf = buffers.get(chatId);
+  if (!buf) {
+    buf = { chunks: [], timer: null };
+    buffers.set(chatId, buf);
+  }
+  buf.chunks.push(text);
+  clearTimeout(buf.timer);
+  buf.timer = setTimeout(() => {
+    buffers.delete(chatId);
+    const transcript = buf.chunks.join("\n").trim();
+    if (transcript) processTranscript(chatId, transcript);
+  }, 3000);
+}
+
+async function handleMessage(msg) {
   const chatId = msg.chat.id;
 
   if (ALLOWED.size > 0 && !ALLOWED.has(chatId)) {
     console.warn("Чужой chat_id:", chatId);
     return;
   }
+
   if (msg.text && msg.text.startsWith("/start")) {
-    send(chatId, "Отправь фото CDL / medical card и заметки в подписи.").catch(() => {});
+    await send(
+      chatId,
+      "Отправь текст расшифровки разговора с водителем (или .txt файл). Я верну готовый шаблон."
+    ).catch(() => {});
     return;
   }
 
-  const groupId = msg.media_group_id;
-  if (!groupId) {
-    processMessages(chatId, [msg]);
+  if (msg.text) {
+    addToBuffer(chatId, msg.text);
     return;
   }
 
-  let album = albums.get(groupId);
-  if (!album) {
-    album = { chatId, msgs: [], timer: null };
-    albums.set(groupId, album);
+  // Расшифровка файлом .txt
+  if (
+    msg.document &&
+    ((msg.document.mime_type || "").startsWith("text/") ||
+      (msg.document.file_name || "").toLowerCase().endsWith(".txt"))
+  ) {
+    try {
+      const text = await downloadTextFile(msg.document.file_id);
+      addToBuffer(chatId, (msg.caption ? msg.caption + "\n" : "") + text);
+    } catch (err) {
+      console.error(err);
+      await send(chatId, "Не удалось прочитать файл: " + err.message).catch(() => {});
+    }
+    return;
   }
-  album.msgs.push(msg);
-  clearTimeout(album.timer);
-  album.timer = setTimeout(() => {
-    albums.delete(groupId);
-    processMessages(album.chatId, album.msgs);
-  }, 2000);
+
+  await send(chatId, "Я понимаю только текст или .txt файл с расшифровкой.").catch(() => {});
 }
 
 // ---------- Polling ----------
@@ -266,7 +280,7 @@ async function pollUpdates() {
         offset = update.update_id + 1;
         if (update.message) {
           try {
-            handleMessage(update.message);
+            await handleMessage(update.message);
           } catch (err) {
             console.error("handleMessage:", err);
           }
@@ -280,7 +294,6 @@ async function pollUpdates() {
 }
 
 // Мини-сервер для Render (Web Service должен слушать порт).
-// UptimeRobot будет пинговать этот адрес, чтобы бот не засыпал.
 const PORT = process.env.PORT || 3000;
 http
   .createServer((req, res) => {
