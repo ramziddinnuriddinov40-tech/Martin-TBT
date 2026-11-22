@@ -3,6 +3,8 @@ import { GoogleGenAI } from "@google/genai";
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Модель можно сменить в Render без правки кода (переменная GEMINI_MODEL)
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 // Пример: ALLOWED_CHAT_IDS=123456789,987654321
 const ALLOWED = new Set(
   (process.env.ALLOWED_CHAT_IDS || "")
@@ -128,7 +130,7 @@ async function askGemini(parts) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: GEMINI_MODEL,
         contents: [{ role: "user", parts }],
         config: { systemInstruction: SYSTEM_PROMPT },
       });
