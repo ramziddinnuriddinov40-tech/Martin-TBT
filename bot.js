@@ -5,6 +5,8 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 // Модель можно сменить в Render без правки кода (переменная GEMINI_MODEL)
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+// Запасная модель на случай перегрузки основной (необязательно)
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "";
 // Пример: ALLOWED_CHAT_IDS=123456789,987654321
 const ALLOWED = new Set(
   (process.env.ALLOWED_CHAT_IDS || "")
@@ -126,25 +128,42 @@ async function downloadTelegramFile(fileId, fallbackMime) {
 // ---------- Gemini ----------
 
 async function askGemini(parts) {
+  // Основная модель + необязательная запасная (GEMINI_FALLBACK_MODEL)
+  const models = [GEMINI_MODEL];
+  if (GEMINI_FALLBACK_MODEL && GEMINI_FALLBACK_MODEL !== GEMINI_MODEL) {
+    models.push(GEMINI_FALLBACK_MODEL);
+  }
+
   let lastErr;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await ai.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: [{ role: "user", parts }],
-        config: { systemInstruction: SYSTEM_PROMPT },
-      });
-      const text = (response.text || "")
-        .replace(/^```[a-z]*\n?/i, "")
-        .replace(/```\s*$/, "")
-        .replace(/\*\*/g, "")
-        .trim();
-      if (text) return text;
-      lastErr = new Error("Gemini вернул пустой ответ");
-    } catch (err) {
-      lastErr = err;
+  for (const model of models) {
+    // 6 попыток, пауза растёт: 2, 4, 8, 16, 30 сек
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: [{ role: "user", parts }],
+          config: { systemInstruction: SYSTEM_PROMPT },
+        });
+        const text = (response.text || "")
+          .replace(/^```[a-z]*\n?/i, "")
+          .replace(/```\s*$/, "")
+          .replace(/\*\*/g, "")
+          .trim();
+        if (text) return text;
+        lastErr = new Error("Gemini вернул пустой ответ");
+      } catch (err) {
+        lastErr = err;
+        const msg = String(err.message || err);
+        // Временные ошибки (перегрузка, лимит) — повторяем.
+        // Остальные (404, 400, 403) — смысла повторять нет.
+        const temporary = /503|429|500|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|fetch failed/i.test(msg);
+        if (!temporary) break;
+      }
+      if (attempt < 6) {
+        console.warn(`Gemini (${model}) попытка ${attempt} не удалась, жду...`);
+        await sleep(Math.min(2000 * 2 ** (attempt - 1), 30000));
+      }
     }
-    await sleep(1500 * attempt);
   }
   throw lastErr;
 }
